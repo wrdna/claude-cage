@@ -1,4 +1,5 @@
 mod app;
+mod board;
 mod session;
 mod skills;
 mod state;
@@ -31,6 +32,12 @@ fn main() -> io::Result<()> {
     if args.len() >= 2 && args[1] == "task" {
         let task_args: Vec<String> = args[2..].to_vec();
         std::process::exit(task::handle_task_cmd(&task_args));
+    }
+
+    // Subcommand: claude-cage board <post|read|pin|reply|clear|list>
+    if args.len() >= 2 && args[1] == "board" {
+        let board_args: Vec<String> = args[2..].to_vec();
+        std::process::exit(board::handle_board_cmd(&board_args));
     }
 
     enable_raw_mode()?;
@@ -70,6 +77,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                             let quit = match app.view_mode {
                                 ViewMode::Sessions => handle_normal(&mut app, key),
                                 ViewMode::Tasks => handle_task_normal(&mut app, key),
+                                ViewMode::Board => handle_board_normal(&mut app, key),
                             };
                             if quit {
                                 return Ok(());
@@ -83,6 +91,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                         Mode::AddSkillCommand => handle_add_skill_command(&mut app, key),
                         Mode::Nudge => handle_nudge(&mut app, key),
                         Mode::TaskChat => handle_task_chat(&mut app, key),
+                        Mode::BoardReply => handle_board_reply(&mut app, key),
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -216,6 +225,101 @@ fn handle_task_normal(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
     false
+}
+
+fn handle_board_normal(app: &mut App, key: KeyEvent) -> bool {
+    // Ctrl+u/d for scroll
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('d') => { app.preview_scroll_by(-(15_isize)); return false; }
+            KeyCode::Char('u') => { app.preview_scroll_by(15); return false; }
+            _ => {}
+        }
+    }
+
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.board_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.board_prev(),
+        KeyCode::Char('f') => {
+            app.board_cycle_filter();
+        }
+        KeyCode::Char('p') => {
+            app.board_toggle_pin();
+            app.flash("Pin toggled");
+        }
+        KeyCode::Char('c') | KeyCode::Enter => {
+            // Reply to selected entry
+            app.start_board_reply();
+        }
+        KeyCode::Char('t') => {
+            app.toggle_view();
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            app.refresh();
+            app.flash("Refreshed");
+        }
+        KeyCode::Char('q') | KeyCode::Esc => return true,
+        _ => {}
+    }
+    false
+}
+
+fn handle_board_reply(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            let msg = app.input.trim().to_string();
+            if !msg.is_empty() {
+                let entry = board::BoardEntry {
+                    id: format!("r-{}", std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    task_id: String::new(),
+                    role: "user".to_string(),
+                    tag: board::EntryTag::Reply,
+                    content: msg,
+                    directed_to: {
+                        // Direct reply to the task that posted the original entry
+                        let entries = board::load_entries();
+                        entries
+                            .iter()
+                            .find(|e| e.id == app.board_reply_target)
+                            .and_then(|e| {
+                                if e.task_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(e.task_id.clone())
+                                }
+                            })
+                    },
+                    reply_to: Some(app.board_reply_target.clone()),
+                    pinned: false,
+                };
+                board::append_entry(&entry);
+                app.board_entries = board::load_entries();
+                app.flash("Reply posted");
+            }
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Backspace => {
+            if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+                app.input.remove(app.input_cursor);
+            }
+        }
+        KeyCode::Char(c) => {
+            app.input.insert(app.input_cursor, c);
+            app.input_cursor += 1;
+        }
+        _ => {}
+    }
 }
 
 fn handle_nudge(app: &mut App, key: KeyEvent) {

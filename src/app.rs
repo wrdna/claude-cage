@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use crate::board::{self, BoardEntry, EntryTag};
 use crate::session::Session;
 use crate::skills::{self, Skill};
 use crate::state;
@@ -16,14 +17,16 @@ pub enum Mode {
     Skill,
     AddSkillName,
     AddSkillCommand,
-    Nudge,     // composing a nudge message for a task
-    TaskChat,  // forwarding keystrokes to a task's linked pane
+    Nudge,      // composing a nudge message for a task
+    TaskChat,   // forwarding keystrokes to a task's linked pane
+    BoardReply, // composing a reply to a board entry
 }
 
 #[derive(PartialEq)]
 pub enum ViewMode {
     Sessions,
     Tasks,
+    Board,
 }
 
 pub struct App {
@@ -44,6 +47,10 @@ pub struct App {
     pub task_selected: usize,
     pub task_expanded: HashSet<String>,
     pub nudge_target_id: String,
+    pub board_entries: Vec<BoardEntry>,
+    pub board_selected: usize,
+    pub board_filter: Option<EntryTag>,
+    pub board_reply_target: String, // entry id being replied to
 }
 
 impl App {
@@ -79,6 +86,10 @@ impl App {
             task_selected: 0,
             task_expanded,
             nudge_target_id: String::new(),
+            board_entries: board::load_entries(),
+            board_selected: 0,
+            board_filter: None,
+            board_reply_target: String::new(),
         }
     }
 
@@ -97,6 +108,15 @@ impl App {
             let flat_len = task::flatten_tree(&self.tasks, &self.task_expanded, 0).len();
             if self.task_selected >= flat_len && flat_len > 0 {
                 self.task_selected = flat_len - 1;
+            }
+        }
+
+        // Always reload board
+        self.board_entries = board::load_entries();
+        if self.view_mode == ViewMode::Board {
+            let visible = self.board_visible_count();
+            if self.board_selected >= visible && visible > 0 {
+                self.board_selected = visible - 1;
             }
         }
     }
@@ -160,6 +180,11 @@ impl App {
                 self.preview_scroll = 0;
             }
             ViewMode::Tasks => {
+                self.board_entries = board::load_entries();
+                self.view_mode = ViewMode::Board;
+                self.preview_scroll = 0;
+            }
+            ViewMode::Board => {
                 self.view_mode = ViewMode::Sessions;
                 self.preview_scroll = 0;
             }
@@ -230,6 +255,81 @@ impl App {
             }
         }
     }
+
+    // ─── Board ───
+
+    /// Get display-ordered indices of visible board entries (filtered + sorted).
+    pub fn board_visible_indices(&self) -> Vec<usize> {
+        let order = board::display_order(&self.board_entries);
+        if let Some(ref tag) = self.board_filter {
+            order
+                .into_iter()
+                .filter(|&i| self.board_entries[i].tag == *tag)
+                .collect()
+        } else {
+            order
+        }
+    }
+
+    pub fn board_visible_count(&self) -> usize {
+        self.board_visible_indices().len()
+    }
+
+    pub fn board_next(&mut self) {
+        let count = self.board_visible_count();
+        if self.board_selected < count.saturating_sub(1) {
+            self.board_selected += 1;
+            self.preview_scroll = 0;
+        }
+    }
+
+    pub fn board_prev(&mut self) {
+        if self.board_selected > 0 {
+            self.board_selected -= 1;
+            self.preview_scroll = 0;
+        }
+    }
+
+    pub fn board_cycle_filter(&mut self) {
+        let tags = EntryTag::all();
+        self.board_filter = match &self.board_filter {
+            None => Some(tags[0].clone()),
+            Some(current) => {
+                let pos = tags.iter().position(|t| t == current).unwrap_or(0);
+                if pos + 1 >= tags.len() {
+                    None // wrap around to "all"
+                } else {
+                    Some(tags[pos + 1].clone())
+                }
+            }
+        };
+        self.board_selected = 0;
+        self.preview_scroll = 0;
+    }
+
+    pub fn selected_board_entry(&self) -> Option<&BoardEntry> {
+        let indices = self.board_visible_indices();
+        indices
+            .get(self.board_selected)
+            .and_then(|&i| self.board_entries.get(i))
+    }
+
+    pub fn board_toggle_pin(&mut self) {
+        if let Some(entry) = self.selected_board_entry() {
+            let id = entry.id.clone();
+            board::toggle_pin(&id);
+            self.board_entries = board::load_entries();
+        }
+    }
+
+    pub fn start_board_reply(&mut self) {
+        if let Some(entry) = self.selected_board_entry() {
+            self.board_reply_target = entry.id.clone();
+            self.mode = Mode::BoardReply;
+            self.input.clear();
+            self.input_cursor = 0;
+        }
+    }
 }
 
 fn view_mode_path() -> std::path::PathBuf {
@@ -245,6 +345,7 @@ fn save_view_mode(mode: &ViewMode) {
     let _ = std::fs::write(&path, match mode {
         ViewMode::Sessions => "sessions",
         ViewMode::Tasks => "tasks",
+        ViewMode::Board => "board",
     });
 }
 
@@ -252,6 +353,7 @@ fn load_view_mode() -> ViewMode {
     let path = view_mode_path();
     match std::fs::read_to_string(&path) {
         Ok(s) if s.trim() == "tasks" => ViewMode::Tasks,
+        Ok(s) if s.trim() == "board" => ViewMode::Board,
         _ => ViewMode::Sessions,
     }
 }

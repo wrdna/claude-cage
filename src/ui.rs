@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Mode, ViewMode};
+use crate::board;
 use crate::session::SessionState;
 use crate::skills;
 use crate::task;
@@ -87,6 +88,23 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 ));
             }
         }
+        ViewMode::Board => {
+            let count = app.board_entries.len();
+            spans.push(Span::styled(
+                format!(" Claude Session Manager  {} entr{}  ", count, if count == 1 { "y" } else { "ies" }),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "[Board]",
+                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+            ));
+            if let Some(ref tag) = app.board_filter {
+                spans.push(Span::styled(
+                    format!("  filter: {}", tag.label()),
+                    Style::default().fg(tag.color()),
+                ));
+            }
+        }
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -115,6 +133,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
     match app.view_mode {
         ViewMode::Sessions => draw_body_sessions(f, area, app),
         ViewMode::Tasks => draw_body_tasks(f, area, app),
+        ViewMode::Board => draw_body_board(f, area, app),
     }
 }
 
@@ -187,6 +206,274 @@ fn draw_body_tasks(f: &mut Frame, area: Rect, app: &App) {
     } else {
         draw_task_details(f, body[1], app);
     }
+}
+
+fn draw_body_board(f: &mut Frame, area: Rect, app: &App) {
+    if app.board_entries.is_empty() {
+        let text = vec![
+            Line::from(""),
+            Line::from("  No board entries yet."),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Agents post findings via "),
+                Span::styled(
+                    "claude-cage board post",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Press "),
+                Span::styled("t", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" to switch views."),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(text), area);
+        return;
+    }
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    draw_board_list(f, body[0], app);
+    draw_board_detail(f, body[1], app);
+}
+
+fn draw_board_list(f: &mut Frame, area: Rect, app: &App) {
+    let filter_label = match &app.board_filter {
+        Some(tag) => format!(" Board [{}] ", tag.label()),
+        None => " Board ".to_string(),
+    };
+    let block = Block::default()
+        .title(filter_label)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let indices = app.board_visible_indices();
+    if indices.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  No entries match filter",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let height = inner.height as usize;
+    // Scroll so selected item is visible
+    let scroll_start = if app.board_selected >= height {
+        app.board_selected - height + 1
+    } else {
+        0
+    };
+
+    let items: Vec<ListItem> = indices
+        .iter()
+        .enumerate()
+        .skip(scroll_start)
+        .take(height)
+        .map(|(i, &entry_idx)| {
+            let entry = &app.board_entries[entry_idx];
+            let selected = i == app.board_selected;
+
+            let mut spans = vec![];
+
+            // Pin indicator
+            if entry.pinned {
+                spans.push(Span::styled(
+                    " * ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw("   "));
+            }
+
+            // Tag badge
+            spans.push(Span::styled(
+                format!("{} ", entry.tag.symbol()),
+                Style::default().fg(entry.tag.color()).add_modifier(Modifier::BOLD),
+            ));
+
+            // Time
+            spans.push(Span::styled(
+                format!("{:>4} ", board::relative_time(entry.timestamp)),
+                Style::default().fg(Color::DarkGray),
+            ));
+
+            // Role badge
+            if !entry.role.is_empty() {
+                spans.push(Span::styled(
+                    format!("[{}] ", entry.role),
+                    Style::default().fg(task::role_color(&entry.role)),
+                ));
+            }
+
+            // Content preview (truncated)
+            let max_content = (inner.width as usize).saturating_sub(
+                spans.iter().map(|s| s.content.len()).sum::<usize>(),
+            );
+            let content_preview: String = entry.content.lines().next().unwrap_or("").chars().take(max_content).collect();
+            spans.push(Span::styled(
+                content_preview,
+                if selected {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ));
+
+            let style = if selected {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(Line::from(spans)).style(style)
+        })
+        .collect();
+
+    f.render_widget(List::new(items), inner);
+}
+
+fn draw_board_detail(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(" Entry Details ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(entry) = app.selected_board_entry() else {
+        return;
+    };
+
+    let mut lines: Vec<Line> = vec![];
+
+    // Tag + time
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{} {}", entry.tag.symbol(), entry.tag.label()),
+            Style::default().fg(entry.tag.color()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {} ago", board::relative_time(entry.timestamp)),
+            Style::default().fg(Color::DarkGray),
+        ),
+        if entry.pinned {
+            Span::styled("  *pinned*", Style::default().fg(Color::Yellow))
+        } else {
+            Span::raw("")
+        },
+    ]));
+
+    // Source
+    let source_label = if entry.task_id.is_empty() {
+        "user".to_string()
+    } else {
+        entry.task_id.clone()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  from: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            &source_label,
+            Style::default().fg(task::role_color(&entry.role)),
+        ),
+        if !entry.role.is_empty() {
+            Span::styled(
+                format!(" ({})", entry.role),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            Span::raw("")
+        },
+    ]));
+
+    // Directed to
+    if let Some(ref to) = entry.directed_to {
+        lines.push(Line::from(vec![
+            Span::styled("  to:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(to, Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    // Reply to
+    if let Some(ref reply_id) = entry.reply_to {
+        lines.push(Line::from(vec![
+            Span::styled("  re:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(reply_id, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    // Content (full, multi-line, scrollable)
+    let content_lines: Vec<Line> = entry
+        .content
+        .lines()
+        .map(|l| Line::from(format!("  {}", l)))
+        .collect();
+
+    let total_lines = lines.len() + content_lines.len();
+    let visible_height = inner.height as usize;
+
+    // Add content lines
+    lines.extend(content_lines);
+
+    // Add reply thread
+    let replies: Vec<&board::BoardEntry> = app
+        .board_entries
+        .iter()
+        .filter(|e| e.reply_to.as_deref() == Some(&entry.id))
+        .collect();
+
+    if !replies.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  --- {} replies ---", replies.len()),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for reply in &replies {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    if reply.task_id.is_empty() {
+                        "user"
+                    } else {
+                        &reply.task_id
+                    },
+                    Style::default().fg(task::role_color(&reply.role)).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {} ago", board::relative_time(reply.timestamp)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            for line in reply.content.lines() {
+                lines.push(Line::from(format!("    {}", line)));
+            }
+        }
+    }
+
+    // Scroll
+    let skip = if lines.len() > visible_height {
+        let max_scroll = lines.len() - visible_height;
+        max_scroll.saturating_sub(app.preview_scroll)
+    } else {
+        0
+    };
+    let visible: Vec<Line> = lines.into_iter().skip(skip).collect();
+
+    f.render_widget(Paragraph::new(visible), inner);
 }
 
 fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
@@ -1210,6 +1497,18 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled("_", Style::default().fg(Color::DarkGray)),
             ])
         }
+        Mode::BoardReply => {
+            Line::from(vec![
+                Span::styled(
+                    " Reply> ",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&app.input),
+                Span::styled("_", Style::default().fg(Color::DarkGray)),
+            ])
+        }
         Mode::Skill | Mode::AddSkillName | Mode::AddSkillCommand => {
             Line::from("")  // popup handles its own display
         }
@@ -1239,6 +1538,16 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                         ("Enter", "expand"),
                         ("c", "chat"),
                         ("m", "nudge"),
+                        ("C-u/d", "scroll"),
+                        ("t", "board"),
+                        ("r", "refresh"),
+                        ("q", "quit"),
+                    ],
+                    ViewMode::Board => vec![
+                        ("j/k", "nav"),
+                        ("c", "reply"),
+                        ("f", "filter"),
+                        ("p", "pin"),
                         ("C-u/d", "scroll"),
                         ("t", "sessions"),
                         ("r", "refresh"),

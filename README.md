@@ -112,7 +112,7 @@ fi
 
 ## Usage
 
-Open with `prefix + m` (or however you bound it). Press `t` to toggle between Sessions and Tasks views.
+Open with `prefix + m` (or however you bound it). Press `t` to cycle between Sessions, Tasks, and Board views.
 
 ### Sessions view
 
@@ -138,6 +138,19 @@ Open with `prefix + m` (or however you bound it). Press `t` to toggle between Se
 | `c` | Chat with task's linked session (or nudge if no session) |
 | `m` | Nudge — send a direction change to the agent |
 | `Ctrl+u`/`Ctrl+d` | Scroll output/preview |
+| `t` | Switch to Board view |
+| `r` | Refresh |
+| `q` / `Esc` | Quit |
+
+### Board view
+
+| Key | Action |
+|-----|--------|
+| `j`/`k` | Navigate entries |
+| `c` / `Enter` | Reply to selected entry |
+| `f` | Cycle tag filter (all / finding / blocker / metric / ...) |
+| `p` | Pin/unpin entry |
+| `Ctrl+u`/`Ctrl+d` | Scroll details |
 | `t` | Switch to Sessions view |
 | `r` | Refresh |
 | `q` / `Esc` | Quit |
@@ -189,6 +202,52 @@ claude-cage task status "$TASK_ID" completed
 claude-cage task append "$TASK_ID" "Final: 75.6% accuracy at 500M steps"
 ```
 
+## Shared board CLI
+
+The board is a cross-agent communication channel. Agents post findings, metrics, and blockers; the user and a supervisor agent can monitor and reply.
+
+```bash
+# Post a finding
+claude-cage board post <task-id> <text> --tag <tag> [--to <task-id>] [--role <role>]
+
+# Read entries (filtered)
+claude-cage board read [--tag <tag>] [--from <task-id>] [--last <n>]
+
+# Reply to an entry
+claude-cage board reply <entry-id> <text>
+
+# Pin/unpin an entry
+claude-cage board pin <entry-id>
+
+# List all entries (or --json for machine-readable)
+claude-cage board list [--json]
+
+# Clear the board
+claude-cage board clear
+```
+
+**Tags:** `finding`, `blocker`, `artifact`, `recommendation`, `question`, `progress`, `metric`, `reply`
+
+### Example: training with board monitoring
+
+```bash
+# Research agent posts findings
+claude-cage board post "$RESEARCH_ID" "Cubic wall penalty outperforms linear by 15%" --tag finding --role research
+
+# Training agent streams metrics
+claude-cage board post "$TRAIN_ID" "Step 1000 | Loss: 0.234 | Acc: 45.2%" --tag metric --role implement
+claude-cage board post "$TRAIN_ID" "Step 2000 | Loss: 0.198 | Acc: 52.1%" --tag metric --role implement
+
+# Training agent flags a blocker
+claude-cage board post "$TRAIN_ID" "Accuracy plateauing at 52% - need curriculum change" --tag blocker --role implement
+
+# User replies from TUI (or CLI)
+claude-cage board reply "b-1234-abcd" "Try increasing LR and switching to curriculum stage 2"
+
+# Supervisor agent monitors and intervenes
+claude-cage board post "" "Recommending LR anneal from 3e-4 to 1e-4" --tag recommendation --role supervisor --to "$TRAIN_ID"
+```
+
 ## Status indicators
 
 | Symbol | State | Color |
@@ -218,6 +277,19 @@ claude-cage task append "$TASK_ID" "Final: 75.6% accuracy at 500M steps"
 | `security` | Red |
 | `test-gen` | Magenta |
 | `architect` | Cyan |
+
+### Board tags
+
+| Symbol | Tag | Color |
+|--------|-----|-------|
+| `~` | Finding | Cyan |
+| `!` | Blocker | Red |
+| `@` | Artifact | Green |
+| `>` | Recommendation | Yellow |
+| `?` | Question | Magenta |
+| `-` | Progress | Blue |
+| `#` | Metric | Light Cyan |
+| `<` | Reply | White |
 
 ## How it works
 
