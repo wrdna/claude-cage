@@ -14,7 +14,8 @@ TUI for managing multiple [Claude Code](https://claude.com/claude-code) sessions
 - **Task chat & nudges** — communicate with agents or redirect them mid-task
 - **Worktree launcher** — spin up a new `claude --worktree` session from the manager
 - **Skills** — saved commands you can fire at any session (e.g., `/orchestrate`, `/implement`)
-- **Persistent view** — remembers your last view (Sessions/Tasks) across restarts
+- **Shared board** — cross-agent communication channel for findings, metrics, blockers, and replies
+- **Persistent view** — remembers your last view (Sessions/Tasks/Board) across restarts
 
 ## Install
 
@@ -112,7 +113,7 @@ fi
 
 ## Usage
 
-Open with `prefix + m` (or however you bound it). Press `t` to cycle between Sessions, Tasks, and Board views.
+Open with `prefix + m` (or however you bound it). Press `1`/`2`/`3` to switch between Sessions, Tasks, and Board views.
 
 ### Sessions view
 
@@ -125,7 +126,7 @@ Open with `prefix + m` (or however you bound it). Press `t` to cycle between Ses
 | `w` | Create new worktree session |
 | `S` | Open skill picker |
 | `K` | Kill session (with confirmation) |
-| `t` | Switch to Tasks view |
+| `1`/`2`/`3` | Switch views (Sessions/Tasks/Board) |
 | `r` | Refresh |
 | `q` / `Esc` | Quit |
 
@@ -138,7 +139,7 @@ Open with `prefix + m` (or however you bound it). Press `t` to cycle between Ses
 | `c` | Chat with task's linked session (or nudge if no session) |
 | `m` | Nudge — send a direction change to the agent |
 | `Ctrl+u`/`Ctrl+d` | Scroll output/preview |
-| `t` | Switch to Board view |
+| `1`/`2`/`3` | Switch views (Sessions/Tasks/Board) |
 | `r` | Refresh |
 | `q` / `Esc` | Quit |
 
@@ -151,7 +152,7 @@ Open with `prefix + m` (or however you bound it). Press `t` to cycle between Ses
 | `f` | Cycle tag filter (all / finding / blocker / metric / ...) |
 | `p` | Pin/unpin entry |
 | `Ctrl+u`/`Ctrl+d` | Scroll details |
-| `t` | Switch to Sessions view |
+| `1`/`2`/`3` | Switch views (Sessions/Tasks/Board) |
 | `r` | Refresh |
 | `q` / `Esc` | Quit |
 
@@ -271,12 +272,19 @@ claude-cage board post "" "Recommending LR anneal from 3e-4 to 1e-4" --tag recom
 | Role | Color |
 |------|-------|
 | `orchestrate` | Cyan |
+| `architect` | Cyan |
+| `supervisor` | Light Magenta |
 | `implement` | Green |
+| `migrate` | Orange |
+| `debug` | Light Yellow |
 | `research` | Yellow |
 | `review` | Blue |
 | `security` | Red |
 | `test-gen` | Magenta |
-| `architect` | Cyan |
+| `benchmark` | Light Green |
+| `docs` | White |
+| `changelog` | Light Blue |
+| `deploy` | Light Red |
 
 ### Board tags
 

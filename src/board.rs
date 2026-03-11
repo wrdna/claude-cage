@@ -111,14 +111,14 @@ fn board_path() -> PathBuf {
     PathBuf::from(home).join(".cache/claude-cage/board.jsonl")
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn gen_id() -> String {
+pub fn gen_id() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let ts = now_unix();

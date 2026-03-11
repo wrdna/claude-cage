@@ -65,7 +65,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                     ));
                 }
                 spans.push(Span::styled(
-                    " — t to view",
+                    " — 2 to view",
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -147,8 +147,10 @@ fn draw_body_sessions(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw("  Press "),
                 Span::styled("n", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::raw(" to start one, or "),
-                Span::styled("t", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(" for task view."),
+                Span::styled("2", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" for task view, "),
+                Span::styled("3", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" for board."),
             ]),
         ];
         f.render_widget(Paragraph::new(text), area);
@@ -186,8 +188,10 @@ fn draw_body_tasks(f: &mut Frame, area: Rect, app: &App) {
             Line::from(""),
             Line::from(vec![
                 Span::raw("  Press "),
-                Span::styled("t", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(" to switch back to sessions."),
+                Span::styled("1", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" for sessions, "),
+                Span::styled("3", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" for board."),
             ]),
         ];
         f.render_widget(Paragraph::new(text), area);
@@ -224,8 +228,10 @@ fn draw_body_board(f: &mut Frame, area: Rect, app: &App) {
             Line::from(""),
             Line::from(vec![
                 Span::raw("  Press "),
-                Span::styled("t", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(" to switch views."),
+                Span::styled("1", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" for sessions, "),
+                Span::styled("2", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" for tasks."),
             ]),
         ];
         f.render_widget(Paragraph::new(text), area);
@@ -1526,10 +1532,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                         ("Enter", "switch"),
                         ("c", "chat"),
                         ("S", "skills"),
-                        ("t", "tasks"),
                         ("n", "new"),
                         ("w", "worktree"),
                         ("K", "kill"),
+                        ("1/2/3", "views"),
                         ("r", "refresh"),
                         ("q", "quit"),
                     ],
@@ -1539,7 +1545,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                         ("c", "chat"),
                         ("m", "nudge"),
                         ("C-u/d", "scroll"),
-                        ("t", "board"),
+                        ("1/2/3", "views"),
                         ("r", "refresh"),
                         ("q", "quit"),
                     ],
@@ -1549,7 +1555,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                         ("f", "filter"),
                         ("p", "pin"),
                         ("C-u/d", "scroll"),
-                        ("t", "sessions"),
+                        ("1/2/3", "views"),
                         ("r", "refresh"),
                         ("q", "quit"),
                     ],

@@ -107,6 +107,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
     }
 }
 
+fn handle_view_keys(app: &mut App, key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('1') => { app.set_view(ViewMode::Sessions); true }
+        KeyCode::Char('2') => { app.set_view(ViewMode::Tasks); true }
+        KeyCode::Char('3') => { app.set_view(ViewMode::Board); true }
+        _ => false,
+    }
+}
+
 fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
     // Ctrl+j/k for preview scroll (1 line), Ctrl+u/d for half-page
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -118,6 +127,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
             _ => {}
         }
     }
+
+    if handle_view_keys(app, &key) { return false; }
 
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => app.next(),
@@ -142,13 +153,9 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Char('w') => {
-            // New worktree session — prompt for name
             app.mode = Mode::Worktree;
             app.input.clear();
             app.input_cursor = 0;
-        }
-        KeyCode::Char('t') => {
-            app.toggle_view();
         }
         KeyCode::Char('S') => {
             if !app.sessions.is_empty() {
@@ -174,7 +181,6 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_task_normal(app: &mut App, key: KeyEvent) -> bool {
-    // Ctrl+u/d for preview scroll
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('d') => { app.preview_scroll_by(-(15_isize)); return false; }
@@ -183,11 +189,12 @@ fn handle_task_normal(app: &mut App, key: KeyEvent) -> bool {
         }
     }
 
+    if handle_view_keys(app, &key) { return false; }
+
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => app.task_next(),
         KeyCode::Char('k') | KeyCode::Up => app.task_prev(),
         KeyCode::Enter | KeyCode::Char(' ') => {
-            // If task has children, toggle expand. If leaf with pane, switch to it.
             let flat = task::flatten_tree(&app.tasks, &app.task_expanded, 0);
             if let Some(ft) = flat.get(app.task_selected) {
                 if ft.has_children {
@@ -201,7 +208,6 @@ fn handle_task_normal(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char('c') => {
-            // Chat: if task has a live linked pane, enter TaskChat. Otherwise, nudge.
             if app.selected_task_pane().is_some()
                 && app.selected_task_pane().as_ref().and_then(|p| app.session_by_pane(p)).is_some()
             {
@@ -210,13 +216,7 @@ fn handle_task_normal(app: &mut App, key: KeyEvent) -> bool {
                 app.start_nudge();
             }
         }
-        KeyCode::Char('m') => {
-            // Always nudge (even if task has a pane)
-            app.start_nudge();
-        }
-        KeyCode::Char('t') => {
-            app.toggle_view();
-        }
+        KeyCode::Char('m') => app.start_nudge(),
         KeyCode::Char('r') | KeyCode::Char('R') => {
             app.refresh();
             app.flash("Refreshed");
@@ -228,7 +228,6 @@ fn handle_task_normal(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_board_normal(app: &mut App, key: KeyEvent) -> bool {
-    // Ctrl+u/d for scroll
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('d') => { app.preview_scroll_by(-(15_isize)); return false; }
@@ -237,23 +236,17 @@ fn handle_board_normal(app: &mut App, key: KeyEvent) -> bool {
         }
     }
 
+    if handle_view_keys(app, &key) { return false; }
+
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => app.board_next(),
         KeyCode::Char('k') | KeyCode::Up => app.board_prev(),
-        KeyCode::Char('f') => {
-            app.board_cycle_filter();
-        }
+        KeyCode::Char('f') => app.board_cycle_filter(),
         KeyCode::Char('p') => {
             app.board_toggle_pin();
             app.flash("Pin toggled");
         }
-        KeyCode::Char('c') | KeyCode::Enter => {
-            // Reply to selected entry
-            app.start_board_reply();
-        }
-        KeyCode::Char('t') => {
-            app.toggle_view();
-        }
+        KeyCode::Char('c') | KeyCode::Enter => app.start_board_reply(),
         KeyCode::Char('r') | KeyCode::Char('R') => {
             app.refresh();
             app.flash("Refreshed");
@@ -272,33 +265,19 @@ fn handle_board_reply(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             let msg = app.input.trim().to_string();
             if !msg.is_empty() {
+                // Look up the original entry's task_id for directed_to
+                let directed_to = app.board_entries.iter()
+                    .find(|e| e.id == app.board_reply_target)
+                    .and_then(|e| if e.task_id.is_empty() { None } else { Some(e.task_id.clone()) });
+
                 let entry = board::BoardEntry {
-                    id: format!("r-{}", std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
+                    id: board::gen_id(),
+                    timestamp: board::now_unix(),
                     task_id: String::new(),
                     role: "user".to_string(),
                     tag: board::EntryTag::Reply,
                     content: msg,
-                    directed_to: {
-                        // Direct reply to the task that posted the original entry
-                        let entries = board::load_entries();
-                        entries
-                            .iter()
-                            .find(|e| e.id == app.board_reply_target)
-                            .and_then(|e| {
-                                if e.task_id.is_empty() {
-                                    None
-                                } else {
-                                    Some(e.task_id.clone())
-                                }
-                            })
-                    },
+                    directed_to,
                     reply_to: Some(app.board_reply_target.clone()),
                     pinned: false,
                 };

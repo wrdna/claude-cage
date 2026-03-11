@@ -166,29 +166,26 @@ impl App {
             .unwrap_or(false)
     }
 
-    pub fn toggle_view(&mut self) {
-        match self.view_mode {
-            ViewMode::Sessions => {
+    pub fn set_view(&mut self, mode: ViewMode) {
+        if self.view_mode == mode {
+            return;
+        }
+        match mode {
+            ViewMode::Sessions => {}
+            ViewMode::Tasks => {
                 self.tasks = task::load_tasks();
-                // Auto-expand root tasks on switch
                 for t in &self.tasks {
                     if !t.subtasks.is_empty() {
                         self.task_expanded.insert(t.id.clone());
                     }
                 }
-                self.view_mode = ViewMode::Tasks;
-                self.preview_scroll = 0;
-            }
-            ViewMode::Tasks => {
-                self.board_entries = board::load_entries();
-                self.view_mode = ViewMode::Board;
-                self.preview_scroll = 0;
             }
             ViewMode::Board => {
-                self.view_mode = ViewMode::Sessions;
-                self.preview_scroll = 0;
+                self.board_entries = board::load_entries();
             }
         }
+        self.view_mode = mode;
+        self.preview_scroll = 0;
         save_view_mode(&self.view_mode);
     }
 
