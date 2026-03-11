@@ -248,7 +248,15 @@ pub fn role_color(role: &str) -> Color {
         "test-gen" => Color::Magenta,
         "research" => Color::Yellow,
         "orchestrate" => Color::LightCyan,
-        _ => Color::White,
+        "docs" => Color::White,
+        "supervisor" => Color::LightMagenta,
+        "benchmark" => Color::LightGreen,
+        "changelog" => Color::LightBlue,
+        "deploy" => Color::LightRed,
+        "debug" => Color::LightYellow,
+        "migrate" => Color::Rgb(255, 165, 0), // orange
+        "user" => Color::White,
+        _ => Color::Gray,
     }
 }
 
