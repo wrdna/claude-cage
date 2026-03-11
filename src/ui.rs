@@ -39,71 +39,63 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![];
 
-    match app.view_mode {
-        ViewMode::Sessions => {
-            let c = app.sessions.len();
+    // Title
+    spans.push(Span::styled(
+        " claude-cage ",
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    ));
+
+    spans.push(Span::styled("  ", Style::default()));
+
+    // Tab bar: Sessions | Tasks | Board
+    let session_count = app.sessions.len();
+    let task_total = count_all_tasks(&app.tasks);
+    let task_active = count_active_tasks(&app.tasks);
+    let board_count = app.board_entries.len();
+
+    // Sessions tab
+    let sess_label = format!(" 1 Sessions({}) ", session_count);
+    if app.view_mode == ViewMode::Sessions {
+        spans.push(Span::styled(sess_label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    } else {
+        spans.push(Span::styled(sess_label, Style::default().fg(Color::DarkGray)));
+    }
+
+    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+
+    // Tasks tab
+    let tasks_label = if task_active > 0 {
+        format!(" 2 Tasks({}/{}) ", task_active, task_total)
+    } else {
+        format!(" 2 Tasks({}) ", task_total)
+    };
+    if app.view_mode == ViewMode::Tasks {
+        spans.push(Span::styled(tasks_label, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+    } else if task_active > 0 {
+        spans.push(Span::styled(tasks_label, Style::default().fg(Color::Yellow)));
+    } else {
+        spans.push(Span::styled(tasks_label, Style::default().fg(Color::DarkGray)));
+    }
+
+    spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+
+    // Board tab
+    let board_label = format!(" 3 Board({}) ", board_count);
+    if app.view_mode == ViewMode::Board {
+        spans.push(Span::styled(board_label, Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)));
+    } else if board_count > 0 {
+        spans.push(Span::styled(board_label, Style::default().fg(Color::Gray)));
+    } else {
+        spans.push(Span::styled(board_label, Style::default().fg(Color::DarkGray)));
+    }
+
+    // Context info after tabs
+    if app.view_mode == ViewMode::Board {
+        if let Some(ref tag) = app.board_filter {
             spans.push(Span::styled(
-                format!(" Claude Session Manager  {} session{}  ", c, if c == 1 { "" } else { "s" }),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                format!("  filter: {}", tag.label()),
+                Style::default().fg(tag.color()),
             ));
-            spans.push(Span::styled(
-                "[Sessions]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ));
-            // Show task count badge if tasks exist
-            if !app.tasks.is_empty() {
-                let active = count_active_tasks(&app.tasks);
-                let total = count_all_tasks(&app.tasks);
-                spans.push(Span::styled(
-                    format!("  {} task{}", total, if total == 1 { "" } else { "s" }),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                if active > 0 {
-                    spans.push(Span::styled(
-                        format!(" ({} active)", active),
-                        Style::default().fg(Color::Yellow),
-                    ));
-                }
-                spans.push(Span::styled(
-                    " — 2 to view",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        }
-        ViewMode::Tasks => {
-            let total = count_all_tasks(&app.tasks);
-            let active = count_active_tasks(&app.tasks);
-            spans.push(Span::styled(
-                format!(" Claude Session Manager  {} task{}  ", total, if total == 1 { "" } else { "s" }),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                "[Tasks]",
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            ));
-            if active > 0 {
-                spans.push(Span::styled(
-                    format!("  {} active", active),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-        }
-        ViewMode::Board => {
-            let count = app.board_entries.len();
-            spans.push(Span::styled(
-                format!(" Claude Session Manager  {} entr{}  ", count, if count == 1 { "y" } else { "ies" }),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                "[Board]",
-                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
-            ));
-            if let Some(ref tag) = app.board_filter {
-                spans.push(Span::styled(
-                    format!("  filter: {}", tag.label()),
-                    Style::default().fg(tag.color()),
-                ));
-            }
         }
     }
 
