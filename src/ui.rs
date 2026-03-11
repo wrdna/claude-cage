@@ -6,9 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, ViewMode};
 use crate::session::SessionState;
 use crate::skills;
+use crate::task;
 use crate::tmux;
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -35,19 +36,89 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let count = app.sessions.len();
-    let title = format!(
-        " Claude Session Manager  {} session{}",
-        count,
-        if count == 1 { "" } else { "s" }
-    );
-    let line = Line::from(vec![
-        Span::styled(title, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    let mut spans = vec![];
+
+    match app.view_mode {
+        ViewMode::Sessions => {
+            let c = app.sessions.len();
+            spans.push(Span::styled(
+                format!(" Claude Session Manager  {} session{}  ", c, if c == 1 { "" } else { "s" }),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "[Sessions]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+            // Show task count badge if tasks exist
+            if !app.tasks.is_empty() {
+                let active = count_active_tasks(&app.tasks);
+                let total = count_all_tasks(&app.tasks);
+                spans.push(Span::styled(
+                    format!("  {} task{}", total, if total == 1 { "" } else { "s" }),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                if active > 0 {
+                    spans.push(Span::styled(
+                        format!(" ({} active)", active),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                spans.push(Span::styled(
+                    " — t to view",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+        ViewMode::Tasks => {
+            let total = count_all_tasks(&app.tasks);
+            let active = count_active_tasks(&app.tasks);
+            spans.push(Span::styled(
+                format!(" Claude Session Manager  {} task{}  ", total, if total == 1 { "" } else { "s" }),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "[Tasks]",
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ));
+            if active > 0 {
+                spans.push(Span::styled(
+                    format!("  {} active", active),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn count_all_tasks(tasks: &[task::Task]) -> usize {
+    let mut count = tasks.len();
+    for t in tasks {
+        count += count_all_tasks(&t.subtasks);
+    }
+    count
+}
+
+fn count_active_tasks(tasks: &[task::Task]) -> usize {
+    let mut count = 0;
+    for t in tasks {
+        if t.status == task::TaskStatus::InProgress {
+            count += 1;
+        }
+        count += count_active_tasks(&t.subtasks);
+    }
+    count
 }
 
 fn draw_body(f: &mut Frame, area: Rect, app: &App) {
+    match app.view_mode {
+        ViewMode::Sessions => draw_body_sessions(f, area, app),
+        ViewMode::Tasks => draw_body_tasks(f, area, app),
+    }
+}
+
+fn draw_body_sessions(f: &mut Frame, area: Rect, app: &App) {
     if app.sessions.is_empty() {
         let text = vec![
             Line::from(""),
@@ -56,7 +127,9 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::raw("  Press "),
                 Span::styled("n", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(" to start one."),
+                Span::raw(" to start one, or "),
+                Span::styled("t", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" for task view."),
             ]),
         ];
         f.render_widget(Paragraph::new(text), area);
@@ -75,6 +148,44 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
         draw_chat_view(f, body[1], app);
     } else {
         draw_details(f, body[1], app);
+    }
+}
+
+fn draw_body_tasks(f: &mut Frame, area: Rect, app: &App) {
+    if app.tasks.is_empty() {
+        let text = vec![
+            Line::from(""),
+            Line::from("  No tasks yet."),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Use "),
+                Span::styled("/orchestrate", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(" or "),
+                Span::styled("/architect", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(" to create tasks."),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Press "),
+                Span::styled("t", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" to switch back to sessions."),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(text), area);
+        return;
+    }
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    draw_task_list(f, body[0], app);
+
+    if app.mode == Mode::TaskChat {
+        draw_task_chat_view(f, body[1], app);
+    } else {
+        draw_task_details(f, body[1], app);
     }
 }
 
@@ -735,6 +846,317 @@ fn draw_skill_popup(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn draw_task_chat_view(f: &mut Frame, area: Rect, app: &App) {
+    let pane_id = match app.selected_task_pane() {
+        Some(p) => p,
+        None => return,
+    };
+    let session = app.session_by_pane(&pane_id);
+    let title_name = app.selected_task().map(|t| t.name.as_str()).unwrap_or("?");
+    let title = format!(" {} — chat  (Esc to exit) ", title_name);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let pid = match session {
+        Some(s) => &s.pane_id,
+        None => return,
+    };
+
+    let height = inner.height as usize;
+    if height > 0 {
+        let capture_lines = height + app.preview_scroll;
+        let raw_lines = tmux::capture_pane(pid, capture_lines);
+        let total = raw_lines.len();
+        let end = total.saturating_sub(app.preview_scroll);
+        let start = end.saturating_sub(height);
+        let lines: Vec<Line> = raw_lines[start..end]
+            .iter()
+            .map(|line| parse_ansi_line(line))
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn draw_task_list(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(" Tasks ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let flat = task::flatten_tree(&app.tasks, &app.task_expanded, 0);
+
+    let mut items: Vec<ListItem> = Vec::new();
+    for (i, ft) in flat.iter().enumerate() {
+        let is_sel = i == app.task_selected;
+        let indent = "  ".repeat(ft.depth);
+
+        // Tree connector
+        let connector = if ft.has_children {
+            if ft.is_expanded { "▼ " } else { "▶ " }
+        } else {
+            "· "
+        };
+
+        // Status icon
+        let status_sym = ft.task.status.symbol();
+        let status_color = ft.task.status.color();
+
+        // Role badge
+        let role_col = task::role_color(&ft.task.role);
+
+        // Truncate name to fit
+        let prefix_len = ft.depth * 2 + 2 + 2; // indent + connector + status+space
+        let suffix_len = if ft.task.role.is_empty() { 0 } else { ft.task.role.len() + 3 }; // " role"
+        let max_name = (inner.width as usize)
+            .saturating_sub(prefix_len + suffix_len + 2);
+        let name = if ft.task.name.len() > max_name && max_name > 2 {
+            format!("{}…", &ft.task.name[..max_name - 1])
+        } else {
+            ft.task.name.clone()
+        };
+
+        let mut spans = vec![
+            Span::raw(indent),
+            Span::styled(
+                connector,
+                Style::default().fg(if ft.has_children { Color::White } else { Color::DarkGray }),
+            ),
+            Span::styled(
+                format!("{} ", status_sym),
+                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(name),
+        ];
+
+        // Role badge
+        if !ft.task.role.is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", ft.task.role),
+                Style::default().fg(role_col),
+            ));
+        }
+
+        // Session link indicator
+        if let Some(ref pid) = ft.task.pane_id {
+            let session_state = app.session_by_pane(pid);
+            let (sym, col) = match session_state {
+                Some(s) => (s.state.symbol(), s.state.color()),
+                None => ("✕", Color::DarkGray), // session gone
+            };
+            spans.push(Span::styled(
+                format!(" {}", sym),
+                Style::default().fg(col),
+            ));
+        }
+
+        let style = if is_sel {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        };
+
+        items.push(ListItem::new(Line::from(spans)).style(style));
+    }
+
+    let list = List::new(items);
+    f.render_widget(list, inner);
+}
+
+/// Calculate the compact info header height for a task.
+fn info_height(t: &task::Task) -> u16 {
+    let mut h: u16 = 4; // name + status/role + session + separator
+    if task::has_nudge(&t.id) {
+        h += 1;
+    }
+    h
+}
+
+fn draw_task_details(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(" Task Details ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let flat = task::flatten_tree(&app.tasks, &app.task_expanded, 0);
+    let Some(ft) = flat.get(app.task_selected) else {
+        return;
+    };
+    let t = ft.task;
+
+    // Check if this task has a linked session with a live pane
+    let linked_session = t.pane_id.as_ref().and_then(|pid| app.session_by_pane(pid));
+    let has_preview = linked_session.is_some();
+    let has_output = !t.output.is_empty();
+
+    // Layout: compact header (fixed) + output (flex) + preview (if linked)
+    // Header is ~4–6 lines. Output gets the bulk. Preview gets 40% if present.
+    let detail_chunks = if has_preview {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(info_height(t)),
+                Constraint::Min(3),        // output
+                Constraint::Percentage(40), // live preview
+            ])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(info_height(t)),
+                Constraint::Min(3), // output gets all remaining space
+            ])
+            .split(inner)
+    };
+
+    // ── Compact info header ──
+    let mut info_lines: Vec<Line> = vec![];
+
+    // Line 1: Name (bold)
+    info_lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            &t.name,
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Line 2: Status + Role on same line
+    let mut status_spans = vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("{} {}", t.status.symbol(), t.status.label()),
+            Style::default().fg(t.status.color()).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !t.role.is_empty() {
+        status_spans.push(Span::styled("  ", Style::default()));
+        status_spans.push(Span::styled(
+            format!("[{}]", &t.role),
+            Style::default().fg(task::role_color(&t.role)),
+        ));
+    }
+    // Subtask progress inline
+    if !t.subtasks.is_empty() {
+        let total = t.subtasks.len();
+        let done = t.subtasks.iter().filter(|s| s.status == task::TaskStatus::Completed).count();
+        let in_prog = t.subtasks.iter().filter(|s| s.status == task::TaskStatus::InProgress).count();
+        status_spans.push(Span::styled("  ", Style::default()));
+        status_spans.push(Span::styled(format!("{}", done), Style::default().fg(Color::Green)));
+        status_spans.push(Span::styled(format!("/{}", total), Style::default().fg(Color::DarkGray)));
+        status_spans.push(Span::styled(" subtasks", Style::default().fg(Color::DarkGray)));
+        if in_prog > 0 {
+            status_spans.push(Span::styled(
+                format!(" ({} active)", in_prog),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+    info_lines.push(Line::from(status_spans));
+
+    // Line 3: Session link
+    let session_span = match &linked_session {
+        Some(s) => Span::styled(
+            format!("{} {} {}", s.addr, s.state.symbol(), s.state.label()),
+            Style::default().fg(s.state.color()),
+        ),
+        None => match &t.pane_id {
+            Some(pid) => Span::styled(
+                format!("{} (gone)", pid),
+                Style::default().fg(Color::DarkGray),
+            ),
+            None => Span::styled("no session", Style::default().fg(Color::DarkGray)),
+        },
+    };
+    info_lines.push(Line::from(vec![
+        Span::styled("  session: ", Style::default().fg(Color::DarkGray)),
+        session_span,
+    ]));
+
+    // Nudge pending
+    if task::has_nudge(&t.id) {
+        info_lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                "NUDGE PENDING",
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    // Separator
+    info_lines.push(Line::from(""));
+
+    f.render_widget(
+        Paragraph::new(info_lines),
+        detail_chunks[0],
+    );
+
+    // ── Output section (scrollable) ──
+    let output_area = detail_chunks[1];
+    let output_block = Block::default()
+        .title(if has_output {
+            format!(" Output ({} lines) ", t.output.lines().count())
+        } else {
+            " Output ".to_string()
+        })
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let output_inner = output_block.inner(output_area);
+    f.render_widget(output_block, output_area);
+
+    if has_output {
+        let output_lines: Vec<Line> = t.output.lines()
+            .map(|l| Line::from(format!("  {}", l)))
+            .collect();
+
+        let total_lines = output_lines.len();
+        let visible_height = output_inner.height as usize;
+
+        // Scroll: preview_scroll=0 means bottom (latest output visible)
+        let skip = if total_lines > visible_height {
+            let max_scroll = total_lines - visible_height;
+            // preview_scroll acts as "lines from bottom"
+            max_scroll.saturating_sub(app.preview_scroll)
+        } else {
+            0
+        };
+
+        let visible: Vec<Line> = output_lines.into_iter().skip(skip).collect();
+        f.render_widget(
+            Paragraph::new(visible),
+            output_inner,
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Waiting for output...",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            output_inner,
+        );
+    }
+
+    // ── Live preview (if linked session) ──
+    if has_preview {
+        if let Some(s) = linked_session {
+            draw_preview(f, detail_chunks[2], s, app.preview_scroll);
+        }
+    }
+}
+
 fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -773,8 +1195,20 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 Line::from("")
             }
         }
-        Mode::Chat => {
+        Mode::Chat | Mode::TaskChat => {
             Line::from("") // chat view handles its own footer
+        }
+        Mode::Nudge => {
+            Line::from(vec![
+                Span::styled(
+                    " Nudge> ",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&app.input),
+                Span::styled("_", Style::default().fg(Color::DarkGray)),
+            ])
         }
         Mode::Skill | Mode::AddSkillName | Mode::AddSkillCommand => {
             Line::from("")  // popup handles its own display
@@ -786,18 +1220,31 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Green),
                 ))
             } else {
-                let keys = vec![
-                    ("j/k", "nav"),
-                    ("C-u/d", "scroll"),
-                    ("Enter", "switch"),
-                    ("c", "chat"),
-                    ("S", "skills"),
-                    ("n", "new"),
-                    ("w", "worktree"),
-                    ("K", "kill"),
-                    ("r", "refresh"),
-                    ("q", "quit"),
-                ];
+                let keys = match app.view_mode {
+                    ViewMode::Sessions => vec![
+                        ("j/k", "nav"),
+                        ("C-u/d", "scroll"),
+                        ("Enter", "switch"),
+                        ("c", "chat"),
+                        ("S", "skills"),
+                        ("t", "tasks"),
+                        ("n", "new"),
+                        ("w", "worktree"),
+                        ("K", "kill"),
+                        ("r", "refresh"),
+                        ("q", "quit"),
+                    ],
+                    ViewMode::Tasks => vec![
+                        ("j/k", "nav"),
+                        ("Enter", "expand"),
+                        ("c", "chat"),
+                        ("m", "nudge"),
+                        ("C-u/d", "scroll"),
+                        ("t", "sessions"),
+                        ("r", "refresh"),
+                        ("q", "quit"),
+                    ],
+                };
                 let mut spans: Vec<Span> = vec![Span::raw(" ")];
                 for (k, d) in keys {
                     spans.push(Span::styled(

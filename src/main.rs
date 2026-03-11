@@ -2,6 +2,7 @@ mod app;
 mod session;
 mod skills;
 mod state;
+mod task;
 mod tmux;
 mod ui;
 
@@ -15,7 +16,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
-use app::{App, Mode};
+use app::{App, Mode, ViewMode};
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -24,6 +25,12 @@ fn main() -> io::Result<()> {
     if args.len() >= 2 && args[1] == "state" {
         let st = args.get(2).map(|s| s.as_str()).unwrap_or("unknown");
         std::process::exit(state::handle_state(st));
+    }
+
+    // Subcommand: claude-cage task <init|add|status|output|nudge|clear|list>
+    if args.len() >= 2 && args[1] == "task" {
+        let task_args: Vec<String> = args[2..].to_vec();
+        std::process::exit(task::handle_task_cmd(&task_args));
     }
 
     enable_raw_mode()?;
@@ -54,13 +61,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
 
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        let poll_ms = if app.mode == Mode::Chat { 50 } else { 500 };
+        let poll_ms = if app.mode == Mode::Chat || app.mode == Mode::TaskChat { 50 } else { 500 };
         if event::poll(Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(key) => {
                     match app.mode {
                         Mode::Normal => {
-                            if handle_normal(&mut app, key) {
+                            let quit = match app.view_mode {
+                                ViewMode::Sessions => handle_normal(&mut app, key),
+                                ViewMode::Tasks => handle_task_normal(&mut app, key),
+                            };
+                            if quit {
                                 return Ok(());
                             }
                         }
@@ -70,6 +81,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                         Mode::Skill => handle_skill(&mut app, key),
                         Mode::AddSkillName => handle_add_skill_name(&mut app, key),
                         Mode::AddSkillCommand => handle_add_skill_command(&mut app, key),
+                        Mode::Nudge => handle_nudge(&mut app, key),
+                        Mode::TaskChat => handle_task_chat(&mut app, key),
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -115,7 +128,8 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char('n') => {
-            tmux::new_window("claude-tmux");
+            let claude = tmux::claude_bin();
+            tmux::new_window(&claude);
             return true;
         }
         KeyCode::Char('w') => {
@@ -123,6 +137,9 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
             app.mode = Mode::Worktree;
             app.input.clear();
             app.input_cursor = 0;
+        }
+        KeyCode::Char('t') => {
+            app.toggle_view();
         }
         KeyCode::Char('S') => {
             if !app.sessions.is_empty() {
@@ -147,6 +164,140 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+fn handle_task_normal(app: &mut App, key: KeyEvent) -> bool {
+    // Ctrl+u/d for preview scroll
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('d') => { app.preview_scroll_by(-(15_isize)); return false; }
+            KeyCode::Char('u') => { app.preview_scroll_by(15); return false; }
+            _ => {}
+        }
+    }
+
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.task_next(),
+        KeyCode::Char('k') | KeyCode::Up => app.task_prev(),
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            // If task has children, toggle expand. If leaf with pane, switch to it.
+            let flat = task::flatten_tree(&app.tasks, &app.task_expanded, 0);
+            if let Some(ft) = flat.get(app.task_selected) {
+                if ft.has_children {
+                    app.toggle_task_expand();
+                } else if let Some(ref pid) = ft.task.pane_id {
+                    if let Some(s) = app.session_by_pane(pid) {
+                        tmux::switch_to(&s.addr);
+                        return true;
+                    }
+                }
+            }
+        }
+        KeyCode::Char('c') => {
+            // Chat: if task has a live linked pane, enter TaskChat. Otherwise, nudge.
+            if app.selected_task_pane().is_some()
+                && app.selected_task_pane().as_ref().and_then(|p| app.session_by_pane(p)).is_some()
+            {
+                app.start_task_chat();
+            } else {
+                app.start_nudge();
+            }
+        }
+        KeyCode::Char('m') => {
+            // Always nudge (even if task has a pane)
+            app.start_nudge();
+        }
+        KeyCode::Char('t') => {
+            app.toggle_view();
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            app.refresh();
+            app.flash("Refreshed");
+        }
+        KeyCode::Char('q') | KeyCode::Esc => return true,
+        _ => {}
+    }
+    false
+}
+
+fn handle_nudge(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            let msg = app.input.trim().to_string();
+            if !msg.is_empty() {
+                task::write_nudge(&app.nudge_target_id, &msg);
+                app.flash(&format!("Nudge sent to {}", app.nudge_target_id));
+            }
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Backspace => {
+            if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+                app.input.remove(app.input_cursor);
+            }
+        }
+        KeyCode::Char(c) => {
+            app.input.insert(app.input_cursor, c);
+            app.input_cursor += 1;
+        }
+        _ => {}
+    }
+}
+
+fn handle_task_chat(app: &mut App, key: KeyEvent) {
+    let pane_id = match app.selected_task_pane() {
+        Some(p) => p,
+        None => {
+            app.mode = Mode::Normal;
+            return;
+        }
+    };
+
+    // Ctrl+] to exit
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(']') {
+        app.mode = Mode::Normal;
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            tmux::send_raw_key(&pane_id, "Enter");
+            app.preview_scroll = 0;
+        }
+        KeyCode::Backspace => {
+            tmux::send_raw_key(&pane_id, "BSpace");
+        }
+        KeyCode::Tab => {
+            tmux::send_raw_key(&pane_id, "Tab");
+        }
+        KeyCode::Up => {
+            tmux::send_raw_key(&pane_id, "Up");
+        }
+        KeyCode::Down => {
+            tmux::send_raw_key(&pane_id, "Down");
+        }
+        KeyCode::Left => {
+            tmux::send_raw_key(&pane_id, "Left");
+        }
+        KeyCode::Right => {
+            tmux::send_raw_key(&pane_id, "Right");
+        }
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let ctrl_key = format!("C-{}", c);
+                tmux::send_raw_key(&pane_id, &ctrl_key);
+            } else {
+                tmux::send_literal(&pane_id, c);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_worktree(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
@@ -156,7 +307,8 @@ fn handle_worktree(app: &mut App, key: KeyEvent) {
             let name = app.input.trim().to_string();
             if !name.is_empty() {
                 // Launch claude with --worktree in a new tmux window
-                let cmd = format!("claude --dangerously-skip-permissions --worktree {}", name);
+                let claude = tmux::claude_bin();
+                let cmd = format!("{} --dangerously-skip-permissions --worktree {}", claude, name);
                 tmux::new_window(&cmd);
                 app.flash(&format!("Worktree '{}' created", name));
             }

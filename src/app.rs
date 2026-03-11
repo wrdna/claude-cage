@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::session::Session;
 use crate::skills::{self, Skill};
 use crate::state;
+use crate::task::{self, Task};
 use crate::tmux;
 
 #[derive(PartialEq)]
@@ -14,6 +16,14 @@ pub enum Mode {
     Skill,
     AddSkillName,
     AddSkillCommand,
+    Nudge,     // composing a nudge message for a task
+    TaskChat,  // forwarding keystrokes to a task's linked pane
+}
+
+#[derive(PartialEq)]
+pub enum ViewMode {
+    Sessions,
+    Tasks,
 }
 
 pub struct App {
@@ -29,12 +39,28 @@ pub struct App {
     pub skills: Vec<Skill>,
     pub skill_selected: usize,
     pub skill_name_buf: String, // temp buffer for add-skill flow
+    pub view_mode: ViewMode,
+    pub tasks: Vec<Task>,
+    pub task_selected: usize,
+    pub task_expanded: HashSet<String>,
+    pub nudge_target_id: String,
 }
 
 impl App {
     pub fn new() -> Self {
         let sessions = tmux::list_claude_sessions();
         let skill_list = skills::load_skills();
+        let tasks = task::load_tasks();
+        let view_mode = load_view_mode();
+
+        // Auto-expand root tasks so the tree isn't all collapsed
+        let mut task_expanded = HashSet::new();
+        for t in &tasks {
+            if !t.subtasks.is_empty() {
+                task_expanded.insert(t.id.clone());
+            }
+        }
+
         Self {
             sessions,
             selected: 0,
@@ -48,6 +74,11 @@ impl App {
             skills: skill_list,
             skill_selected: 0,
             skill_name_buf: String::new(),
+            view_mode,
+            tasks,
+            task_selected: 0,
+            task_expanded,
+            nudge_target_id: String::new(),
         }
     }
 
@@ -59,6 +90,15 @@ impl App {
         // Clean up state files for panes that no longer exist
         let active_ids: Vec<String> = self.sessions.iter().map(|s| s.pane_id.clone()).collect();
         state::cleanup_stale(&active_ids);
+
+        // Always reload tasks so the badge/count stays current
+        self.tasks = task::load_tasks();
+        if self.view_mode == ViewMode::Tasks {
+            let flat_len = task::flatten_tree(&self.tasks, &self.task_expanded, 0).len();
+            if self.task_selected >= flat_len && flat_len > 0 {
+                self.task_selected = flat_len - 1;
+            }
+        }
     }
 
     pub fn next(&mut self) {
@@ -104,5 +144,114 @@ impl App {
         self.flash_time
             .map(|t| t.elapsed().as_secs_f32() < 2.5)
             .unwrap_or(false)
+    }
+
+    pub fn toggle_view(&mut self) {
+        match self.view_mode {
+            ViewMode::Sessions => {
+                self.tasks = task::load_tasks();
+                // Auto-expand root tasks on switch
+                for t in &self.tasks {
+                    if !t.subtasks.is_empty() {
+                        self.task_expanded.insert(t.id.clone());
+                    }
+                }
+                self.view_mode = ViewMode::Tasks;
+                self.preview_scroll = 0;
+            }
+            ViewMode::Tasks => {
+                self.view_mode = ViewMode::Sessions;
+                self.preview_scroll = 0;
+            }
+        }
+        save_view_mode(&self.view_mode);
+    }
+
+    pub fn task_next(&mut self) {
+        let flat = task::flatten_tree(&self.tasks, &self.task_expanded, 0);
+        if self.task_selected < flat.len().saturating_sub(1) {
+            self.task_selected += 1;
+            self.preview_scroll = 0;
+        }
+    }
+
+    pub fn task_prev(&mut self) {
+        if self.task_selected > 0 {
+            self.task_selected -= 1;
+            self.preview_scroll = 0;
+        }
+    }
+
+    pub fn toggle_task_expand(&mut self) {
+        let flat = task::flatten_tree(&self.tasks, &self.task_expanded, 0);
+        if let Some(ft) = flat.get(self.task_selected) {
+            if ft.has_children {
+                let id = ft.task.id.clone();
+                if self.task_expanded.contains(&id) {
+                    self.task_expanded.remove(&id);
+                } else {
+                    self.task_expanded.insert(id);
+                }
+            }
+        }
+    }
+
+    pub fn selected_task(&self) -> Option<&Task> {
+        let flat = task::flatten_tree(&self.tasks, &self.task_expanded, 0);
+        flat.get(self.task_selected).map(|ft| ft.task)
+    }
+
+    /// Get the pane_id of the selected task's linked session.
+    pub fn selected_task_pane(&self) -> Option<String> {
+        self.selected_task().and_then(|t| t.pane_id.clone())
+    }
+
+    /// Find a session by pane_id.
+    pub fn session_by_pane(&self, pane_id: &str) -> Option<&Session> {
+        self.sessions.iter().find(|s| s.pane_id == pane_id)
+    }
+
+    /// Start nudge mode: compose a message for the selected task.
+    pub fn start_nudge(&mut self) {
+        if let Some(t) = self.selected_task() {
+            self.nudge_target_id = t.id.clone();
+            self.mode = Mode::Nudge;
+            self.input.clear();
+            self.input_cursor = 0;
+        }
+    }
+
+    /// Start task chat: forward keystrokes to the selected task's linked pane.
+    pub fn start_task_chat(&mut self) {
+        if let Some(pane_id) = self.selected_task_pane() {
+            if self.session_by_pane(&pane_id).is_some() {
+                self.mode = Mode::TaskChat;
+                self.preview_scroll = 0;
+            }
+        }
+    }
+}
+
+fn view_mode_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".cache/claude-cage/view_mode")
+}
+
+fn save_view_mode(mode: &ViewMode) {
+    let path = view_mode_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, match mode {
+        ViewMode::Sessions => "sessions",
+        ViewMode::Tasks => "tasks",
+    });
+}
+
+fn load_view_mode() -> ViewMode {
+    let path = view_mode_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) if s.trim() == "tasks" => ViewMode::Tasks,
+        _ => ViewMode::Sessions,
     }
 }

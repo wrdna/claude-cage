@@ -58,5 +58,40 @@ pub fn kill_pane(pane_id: &str) {
 }
 
 pub fn new_window(cmd: &str) {
-    run(&["new-window", cmd]);
+    // -- separates tmux flags from the shell command
+    // bash -lc ensures login shell so nvm/PATH are loaded
+    run(&["new-window", "-n", "claude", "--", "bash", "-lc", cmd]);
+}
+
+/// Find the full path to the claude binary.
+pub fn claude_bin() -> String {
+    // Check common locations
+    for path in &[
+        // Direct which lookup (works if current shell has it)
+        "",
+        // nvm default
+        "/home/wrdna/.nvm/versions/node/v18.20.8/bin/claude",
+        // Global npm
+        "/usr/local/bin/claude",
+        "/usr/bin/claude",
+    ] {
+        if path.is_empty() {
+            // Try which
+            if let Ok(output) = std::process::Command::new("which")
+                .arg("claude")
+                .output()
+            {
+                if output.status.success() {
+                    let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !p.is_empty() {
+                        return p;
+                    }
+                }
+            }
+        } else if std::path::Path::new(path).exists() {
+            return path.to_string();
+        }
+    }
+    // Fallback — hope it's on PATH in the new shell
+    "claude".to_string()
 }
