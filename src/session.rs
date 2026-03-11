@@ -2,6 +2,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[derive(Clone, Debug, Default)]
+pub struct ContextUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read: u64,
+    pub cache_create: u64,
+    pub total_context: u64, // approximate current context window usage
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub addr: String,
@@ -15,6 +24,7 @@ pub struct Session {
     pub branch: String,
     pub project: String,    // root repo name
     pub worktree: String,   // worktree name (empty if main)
+    pub context: Option<ContextUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,42 +73,29 @@ fn read_file(path: &PathBuf) -> String {
     fs::read_to_string(path).unwrap_or_default().trim().to_string()
 }
 
-/// Get the git branch for a directory
-fn git_branch(dir: &str) -> String {
-    Command::new("git")
-        .args(["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"])
+/// Get git branch and toplevel in a single call to reduce subprocess overhead.
+fn git_info(dir: &str) -> (String, String) {
+    // Single git call: outputs branch on line 1, toplevel on line 2
+    let output = Command::new("git")
+        .args(["-C", dir, "rev-parse", "--abbrev-ref", "HEAD", "--show-toplevel"])
         .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default()
+        .ok();
+
+    match output {
+        Some(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let mut lines = text.lines();
+            let branch = lines.next().unwrap_or("").trim().to_string();
+            let toplevel = lines.next().unwrap_or("").trim().to_string();
+            (branch, toplevel)
+        }
+        _ => (String::new(), String::new()),
+    }
 }
 
-/// Get the top-level git repo root for a directory
-fn git_toplevel(dir: &str) -> String {
-    Command::new("git")
-        .args(["-C", dir, "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default()
-}
-
-/// Determine project name and worktree name from the path
-fn parse_project_worktree(path: &str, home: &str) -> (String, String) {
-    let toplevel = git_toplevel(path);
-
+/// Determine project name and worktree name from the path.
+/// Takes pre-fetched toplevel to avoid redundant git calls.
+fn parse_project_worktree(path: &str, toplevel: &str, _home: &str) -> (String, String) {
     // Check if this is inside a .claude/worktrees/ path
     if path.contains("/.claude/worktrees/") {
         // Path like /home/user/dev/myproject/.claude/worktrees/feature-auth
@@ -134,6 +131,74 @@ fn parse_project_worktree(path: &str, home: &str) -> (String, String) {
     (project, String::new())
 }
 
+/// Read context/token usage from the most recent Claude session JSONL for this path.
+fn read_context_usage(path: &str, home: &str) -> Option<ContextUsage> {
+    // Convert path to Claude project directory name: /home/user/dev/foo → -home-user-dev-foo
+    let project_dir_name = path.replace('/', "-");
+    let claude_dir = PathBuf::from(home).join(".claude/projects").join(&project_dir_name);
+
+    if !claude_dir.is_dir() {
+        return None;
+    }
+
+    // Find the most recently modified .jsonl file
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(entries) = fs::read_dir(&claude_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Ok(meta) = p.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if newest.as_ref().map_or(true, |(t, _)| modified > *t) {
+                            newest = Some((modified, p));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let jsonl_path = newest?.1;
+
+    // Read the file from the end to find the last assistant message with usage.
+    // For efficiency, read only the last 64KB.
+    let file = fs::File::open(&jsonl_path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let read_start = if file_len > 65536 { file_len - 65536 } else { 0 };
+
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(read_start)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    // Parse lines from end, find last assistant message with usage
+    for line in buf.lines().rev() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                if let Some(msg) = v.get("message") {
+                    if let Some(usage) = msg.get("usage") {
+                        let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let output = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let cache_create = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let total_context = input + cache_read + cache_create;
+                        return Some(ContextUsage {
+                            input_tokens: input,
+                            output_tokens: output,
+                            cache_read,
+                            cache_create,
+                            total_context,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 impl Session {
     pub fn from_tmux_line(line: &str) -> Option<Self> {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -165,8 +230,9 @@ impl Session {
 
         let title = read_file(&dir.join(format!("{}.title", pane_id)));
         let task = read_file(&dir.join(format!("{}.task", pane_id)));
-        let branch = git_branch(&path);
-        let (project, worktree) = parse_project_worktree(&path, &home);
+        let (branch, toplevel) = git_info(&path);
+        let (project, worktree) = parse_project_worktree(&path, &toplevel, &home);
+        let context = read_context_usage(&path, &home);
 
         Some(Session {
             addr: parts[0].to_string(),
@@ -180,6 +246,7 @@ impl Session {
             branch,
             project,
             worktree,
+            context,
         })
     }
 

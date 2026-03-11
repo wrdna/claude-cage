@@ -42,6 +42,17 @@ pub fn send_keys(pane_id: &str, text: &str) {
     run(&["send-keys", "-t", pane_id, text, "Enter"]);
 }
 
+/// Send a raw tmux key name (e.g. "Enter", "BSpace", "C-c", "Up")
+pub fn send_raw_key(pane_id: &str, key: &str) {
+    run(&["send-keys", "-t", pane_id, key]);
+}
+
+/// Send a literal character (handles special chars that tmux interprets)
+pub fn send_literal(pane_id: &str, c: char) {
+    let s = c.to_string();
+    run(&["send-keys", "-t", pane_id, "-l", &s]);
+}
+
 pub fn kill_pane(pane_id: &str) {
     run(&["kill-pane", "-t", pane_id]);
 }

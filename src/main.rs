@@ -1,5 +1,7 @@
 mod app;
 mod session;
+mod skills;
+mod state;
 mod tmux;
 mod ui;
 
@@ -7,7 +9,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,16 +18,24 @@ use ratatui::prelude::*;
 use app::{App, Mode};
 
 fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Subcommand: claude-cage state <working|idle|waiting>
+    if args.len() >= 2 && args[1] == "state" {
+        let st = args.get(2).map(|s| s.as_str()).unwrap_or("unknown");
+        std::process::exit(state::handle_state(st));
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     result
@@ -44,24 +54,49 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
 
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        if event::poll(Duration::from_millis(500))? {
-            if let Event::Key(key) = event::read()? {
-                match app.mode {
-                    Mode::Normal => {
-                        if handle_normal(&mut app, key) {
-                            return Ok(());
+        let poll_ms = if app.mode == Mode::Chat { 50 } else { 500 };
+        if event::poll(Duration::from_millis(poll_ms))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    match app.mode {
+                        Mode::Normal => {
+                            if handle_normal(&mut app, key) {
+                                return Ok(());
+                            }
                         }
+                        Mode::Chat => handle_chat(&mut app, key),
+                        Mode::Worktree => handle_worktree(&mut app, key),
+                        Mode::ConfirmKill => handle_confirm_kill(&mut app, key),
+                        Mode::Skill => handle_skill(&mut app, key),
+                        Mode::AddSkillName => handle_add_skill_name(&mut app, key),
+                        Mode::AddSkillCommand => handle_add_skill_command(&mut app, key),
                     }
-                    Mode::Send => handle_send(&mut app, key),
-                    Mode::Worktree => handle_worktree(&mut app, key),
-                    Mode::ConfirmKill => handle_confirm_kill(&mut app, key),
                 }
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.preview_up(),
+                        MouseEventKind::ScrollDown => app.preview_down(),
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
     }
 }
 
 fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
+    // Ctrl+j/k for preview scroll (1 line), Ctrl+u/d for half-page
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('j') => { app.preview_down(); return false; }
+            KeyCode::Char('k') => { app.preview_up(); return false; }
+            KeyCode::Char('d') => { app.preview_scroll_by(-(15_isize)); return false; }
+            KeyCode::Char('u') => { app.preview_scroll_by(15); return false; }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => app.next(),
         KeyCode::Char('k') | KeyCode::Up => app.prev(),
@@ -71,11 +106,12 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
                 return true;
             }
         }
-        KeyCode::Char('s') => {
+        KeyCode::Char('c') => {
             if !app.sessions.is_empty() {
-                app.mode = Mode::Send;
+                app.mode = Mode::Chat;
                 app.input.clear();
                 app.input_cursor = 0;
+                app.preview_scroll = 0;
             }
         }
         KeyCode::Char('n') => {
@@ -87,6 +123,14 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
             app.mode = Mode::Worktree;
             app.input.clear();
             app.input_cursor = 0;
+        }
+        KeyCode::Char('S') => {
+            if !app.sessions.is_empty() {
+                app.mode = Mode::Skill;
+                app.input.clear();
+                app.input_cursor = 0;
+                app.skill_selected = 0;
+            }
         }
         KeyCode::Char('K') => {
             if !app.sessions.is_empty() {
@@ -101,60 +145,6 @@ fn handle_normal(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
     false
-}
-
-fn handle_send(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Enter => {
-            let input = app.input.trim().to_string();
-            if !input.is_empty() {
-                if let Some(s) = app.selected_session() {
-                    let addr = s.addr.clone();
-                    tmux::send_keys(&s.pane_id, &input);
-                    app.flash(&format!("Sent to {}", addr));
-                }
-            }
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Backspace => {
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                // Alt+Backspace: delete word
-                while app.input_cursor > 0
-                    && app.input.chars().nth(app.input_cursor - 1) == Some(' ')
-                {
-                    app.input_cursor -= 1;
-                    app.input.remove(app.input_cursor);
-                }
-                while app.input_cursor > 0
-                    && app.input.chars().nth(app.input_cursor - 1) != Some(' ')
-                {
-                    app.input_cursor -= 1;
-                    app.input.remove(app.input_cursor);
-                }
-            } else if app.input_cursor > 0 {
-                app.input_cursor -= 1;
-                app.input.remove(app.input_cursor);
-            }
-        }
-        KeyCode::Left => {
-            if app.input_cursor > 0 {
-                app.input_cursor -= 1;
-            }
-        }
-        KeyCode::Right => {
-            if app.input_cursor < app.input.len() {
-                app.input_cursor += 1;
-            }
-        }
-        KeyCode::Char(c) => {
-            app.input.insert(app.input_cursor, c);
-            app.input_cursor += 1;
-        }
-        _ => {}
-    }
 }
 
 fn handle_worktree(app: &mut App, key: KeyEvent) {
@@ -186,6 +176,59 @@ fn handle_worktree(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_chat(app: &mut App, key: KeyEvent) {
+    let Some(s) = app.selected_session() else {
+        app.mode = Mode::Normal;
+        return;
+    };
+    let pane_id = s.pane_id.clone();
+
+    // Ctrl+] to exit chat mode (like SSH escape)
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(']') {
+        app.mode = Mode::Normal;
+        return;
+    }
+
+    // Forward everything directly to the target pane
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            tmux::send_raw_key(&pane_id, "Enter");
+            app.preview_scroll = 0;
+        }
+        KeyCode::Backspace => {
+            tmux::send_raw_key(&pane_id, "BSpace");
+        }
+        KeyCode::Tab => {
+            tmux::send_raw_key(&pane_id, "Tab");
+        }
+        KeyCode::Up => {
+            tmux::send_raw_key(&pane_id, "Up");
+        }
+        KeyCode::Down => {
+            tmux::send_raw_key(&pane_id, "Down");
+        }
+        KeyCode::Left => {
+            tmux::send_raw_key(&pane_id, "Left");
+        }
+        KeyCode::Right => {
+            tmux::send_raw_key(&pane_id, "Right");
+        }
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                // Forward Ctrl+key combos (e.g. Ctrl+C, Ctrl+D)
+                let ctrl_key = format!("C-{}", c);
+                tmux::send_raw_key(&pane_id, &ctrl_key);
+            } else {
+                tmux::send_literal(&pane_id, c);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_confirm_kill(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('y') {
         if let Some(s) = app.selected_session() {
@@ -197,4 +240,140 @@ fn handle_confirm_kill(app: &mut App, key: KeyEvent) {
         }
     }
     app.mode = Mode::Normal;
+}
+
+fn handle_skill(app: &mut App, key: KeyEvent) {
+    let filtered = skills::filter_and_sort(&app.skills, &app.input);
+    let count = filtered.len();
+
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            if let Some(&(_, skill)) = filtered.get(app.skill_selected) {
+                if let Some(s) = app.selected_session() {
+                    let addr = s.addr.clone();
+                    let cmd = skill.command.clone();
+                    tmux::send_keys(&s.pane_id, &cmd);
+                    app.flash(&format!("Ran '{}' on {}", skill.name, addr));
+                }
+            }
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            if app.skill_selected > 0 {
+                app.skill_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            if app.skill_selected < count.saturating_sub(1) {
+                app.skill_selected += 1;
+            }
+        }
+        KeyCode::Backspace => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                while app.input_cursor > 0
+                    && app.input.chars().nth(app.input_cursor - 1) == Some(' ')
+                {
+                    app.input_cursor -= 1;
+                    app.input.remove(app.input_cursor);
+                }
+                while app.input_cursor > 0
+                    && app.input.chars().nth(app.input_cursor - 1) != Some(' ')
+                {
+                    app.input_cursor -= 1;
+                    app.input.remove(app.input_cursor);
+                }
+            } else if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+                app.input.remove(app.input_cursor);
+            }
+            app.skill_selected = 0; // reset selection on input change
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+a to add a new skill
+            app.mode = Mode::AddSkillName;
+            app.input.clear();
+            app.input_cursor = 0;
+        }
+        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+x to delete selected skill
+            if let Some(&(orig_idx, _)) = filtered.get(app.skill_selected) {
+                let name = app.skills[orig_idx].name.clone();
+                app.skills.remove(orig_idx);
+                skills::save_skills(&app.skills);
+                app.flash(&format!("Deleted '{}'", name));
+                if app.skill_selected >= app.skills.len() && app.skill_selected > 0 {
+                    app.skill_selected -= 1;
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            app.input.insert(app.input_cursor, c);
+            app.input_cursor += 1;
+            app.skill_selected = 0;
+        }
+        _ => {}
+    }
+}
+
+fn handle_add_skill_name(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            let name = app.input.trim().to_string();
+            if !name.is_empty() {
+                app.skill_name_buf = name;
+                app.mode = Mode::AddSkillCommand;
+                app.input.clear();
+                app.input_cursor = 0;
+            }
+        }
+        KeyCode::Backspace => {
+            if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+                app.input.remove(app.input_cursor);
+            }
+        }
+        KeyCode::Char(c) => {
+            app.input.insert(app.input_cursor, c);
+            app.input_cursor += 1;
+        }
+        _ => {}
+    }
+}
+
+fn handle_add_skill_command(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            let command = app.input.trim().to_string();
+            if !command.is_empty() {
+                let name = app.skill_name_buf.clone();
+                app.skills.push(skills::Skill {
+                    name: name.clone(),
+                    command,
+                });
+                skills::save_skills(&app.skills);
+                app.flash(&format!("Added skill '{}'", name));
+            }
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Backspace => {
+            if app.input_cursor > 0 {
+                app.input_cursor -= 1;
+                app.input.remove(app.input_cursor);
+            }
+        }
+        KeyCode::Char(c) => {
+            app.input.insert(app.input_cursor, c);
+            app.input_cursor += 1;
+        }
+        _ => {}
+    }
 }

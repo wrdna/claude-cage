@@ -2,12 +2,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
 use crate::app::{App, Mode};
 use crate::session::SessionState;
+use crate::skills;
 use crate::tmux;
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -26,6 +27,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_header(f, chunks[0], app);
     draw_body(f, chunks[1], app);
     draw_footer(f, chunks[2], app);
+
+    // Skill picker overlay
+    if app.mode == Mode::Skill || app.mode == Mode::AddSkillName || app.mode == Mode::AddSkillCommand {
+        draw_skill_popup(f, size, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -57,14 +63,46 @@ fn draw_body(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Split: left list | right details
+    // Split: left list | right details/chat
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
     draw_session_list(f, body[0], app);
-    draw_details(f, body[1], app);
+
+    if app.mode == Mode::Chat {
+        draw_chat_view(f, body[1], app);
+    } else {
+        draw_details(f, body[1], app);
+    }
+}
+
+fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
+    let Some(s) = app.selected_session() else { return };
+
+    let title = format!(" {} — {}  (Esc to exit) ", s.addr, s.project);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let height = inner.height as usize;
+    if height > 0 {
+        let capture_lines = height + app.preview_scroll;
+        let raw_lines = tmux::capture_pane(&s.pane_id, capture_lines);
+        let total = raw_lines.len();
+        let end = total.saturating_sub(app.preview_scroll);
+        let start = end.saturating_sub(height);
+        let lines: Vec<Line> = raw_lines[start..end]
+            .iter()
+            .map(|line| parse_ansi_line(line))
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 fn draw_session_list(f: &mut Frame, area: Rect, app: &App) {
@@ -230,7 +268,8 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Split details area: info top, preview bottom
-    let info_height = 14 + if !s.worktree.is_empty() { 1 } else { 0 };
+    let ctx_lines = if s.context.is_some() { 5 } else { 2 };
+    let info_height = 14 + ctx_lines + if !s.worktree.is_empty() { 1 } else { 0 };
     let detail_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(info_height), Constraint::Min(3)])
@@ -336,15 +375,92 @@ fn draw_details(f: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
+    // Context usage
+    info_lines.push(Line::from(""));
+    info_lines.push(Line::from(vec![
+        Span::styled(
+            "  Context",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(ctx) = &s.context {
+        // Show context bar (200k window)
+        let max_context: u64 = 200_000;
+        let pct = ((ctx.total_context as f64 / max_context as f64) * 100.0).min(100.0);
+        let bar_width = (inner.width as usize).saturating_sub(6);
+        let filled = ((pct / 100.0) * bar_width as f64) as usize;
+        let empty = bar_width.saturating_sub(filled);
+
+        let bar_color = if pct > 90.0 {
+            Color::Red
+        } else if pct > 70.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+
+        info_lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "█".repeat(filled),
+                Style::default().fg(bar_color),
+            ),
+            Span::styled(
+                "░".repeat(empty),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!(" {:.0}%", pct),
+                Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        info_lines.push(Line::from(vec![
+            Span::styled("  Tokens: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format_tokens(ctx.total_context)),
+            Span::styled(" / 200k", Style::default().fg(Color::DarkGray)),
+            Span::raw("    "),
+            Span::styled("out: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format_tokens(ctx.output_tokens)),
+        ]));
+
+        if ctx.cache_read > 0 || ctx.cache_create > 0 {
+            info_lines.push(Line::from(vec![
+                Span::styled("  Cache:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}  read", format_tokens(ctx.cache_read)),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{}  new", format_tokens(ctx.cache_create)),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
+    } else {
+        info_lines.push(Line::from(Span::styled(
+            "  —",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     f.render_widget(Paragraph::new(info_lines).wrap(Wrap { trim: false }), detail_chunks[0]);
 
     // Preview section
-    draw_preview(f, detail_chunks[1], s);
+    draw_preview(f, detail_chunks[1], s, app.preview_scroll);
 }
 
-fn draw_preview(f: &mut Frame, area: Rect, s: &crate::session::Session) {
+fn draw_preview(f: &mut Frame, area: Rect, s: &crate::session::Session, scroll: usize) {
+    let title = if scroll > 0 {
+        format!(" Preview [+{}] ", scroll)
+    } else {
+        " Preview ".to_string()
+    };
     let block = Block::default()
-        .title(" Preview ")
+        .title(title)
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -356,16 +472,18 @@ fn draw_preview(f: &mut Frame, area: Rect, s: &crate::session::Session) {
         return;
     }
 
-    let raw_lines = tmux::capture_pane(&s.pane_id, height);
+    // Capture more lines to allow scrolling back
+    let capture_lines = height + scroll;
+    let raw_lines = tmux::capture_pane(&s.pane_id, capture_lines);
 
     // Parse ANSI escape sequences and render with proper colors
-    let lines: Vec<Line> = raw_lines
+    // Take from the end, skip `scroll` lines, then take `height` visible lines
+    let total = raw_lines.len();
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+
+    let lines: Vec<Line> = raw_lines[start..end]
         .iter()
-        .rev()
-        .take(height)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .map(|line| parse_ansi_line(line))
         .collect();
 
@@ -506,23 +624,129 @@ fn ansi_to_color(n: u16) -> Color {
     }
 }
 
+fn draw_skill_popup(f: &mut Frame, area: Rect, app: &App) {
+    // Center popup: 50% width, up to 60% height
+    let popup_w = (area.width as f32 * 0.5).max(30.0).min(area.width as f32) as u16;
+    let popup_h = (area.height as f32 * 0.6).max(8.0).min(area.height as f32) as u16;
+    let x = (area.width.saturating_sub(popup_w)) / 2;
+    let y = (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect::new(x, y, popup_w, popup_h);
+
+    // Clear background
+    f.render_widget(Clear, popup_area);
+
+    let title = match app.mode {
+        Mode::AddSkillName => " New Skill — Name ",
+        Mode::AddSkillCommand => &format!(" New Skill '{}' — Command ", app.skill_name_buf),
+        _ => " Skills ",
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    if app.mode == Mode::AddSkillName || app.mode == Mode::AddSkillCommand {
+        // Simple input prompt
+        let prompt_label = if app.mode == Mode::AddSkillName {
+            "Name: "
+        } else {
+            "Command: "
+        };
+        let line = Line::from(vec![
+            Span::styled(prompt_label, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(&app.input),
+            Span::styled("_", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(line), inner);
+        return;
+    }
+
+    // Skill mode: search bar + filtered list
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    // Search input
+    let search_line = Line::from(vec![
+        Span::styled(" > ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw(&app.input),
+        Span::styled("_", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(search_line), layout[0]);
+
+    // Hint line
+    let hint = Line::from(vec![
+        Span::styled("  Tab", Style::default().fg(Color::Green)),
+        Span::styled("/", Style::default().fg(Color::DarkGray)),
+        Span::styled("Shift-Tab", Style::default().fg(Color::Green)),
+        Span::styled(" nav  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter", Style::default().fg(Color::Green)),
+        Span::styled(" run  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("C-a", Style::default().fg(Color::Green)),
+        Span::styled(" add  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("C-x", Style::default().fg(Color::Green)),
+        Span::styled(" del", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(hint), layout[1]);
+
+    // Filtered skill list
+    let filtered = skills::filter_and_sort(&app.skills, &app.input);
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, (_, skill))| {
+            let is_sel = i == app.skill_selected;
+            let marker = if is_sel { ">" } else { " " };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {} ", marker),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    &skill.name,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", skill.command),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            let style = if is_sel {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    if items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("  No matching skills", Style::default().fg(Color::DarkGray))),
+            layout[2],
+        );
+    } else {
+        f.render_widget(List::new(items), layout[2]);
+    }
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let line = match &app.mode {
-        Mode::Send => {
-            if let Some(s) = app.selected_session() {
-                Line::from(vec![
-                    Span::styled(
-                        format!(" → {}> ", s.addr),
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(&app.input),
-                ])
-            } else {
-                Line::from("")
-            }
-        }
         Mode::Worktree => {
             Line::from(vec![
                 Span::styled(
@@ -549,6 +773,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 Line::from("")
             }
         }
+        Mode::Chat => {
+            Line::from("") // chat view handles its own footer
+        }
+        Mode::Skill | Mode::AddSkillName | Mode::AddSkillCommand => {
+            Line::from("")  // popup handles its own display
+        }
         Mode::Normal => {
             if app.flash_active() {
                 Line::from(Span::styled(
@@ -558,8 +788,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 let keys = vec![
                     ("j/k", "nav"),
+                    ("C-u/d", "scroll"),
                     ("Enter", "switch"),
-                    ("s", "send"),
+                    ("c", "chat"),
+                    ("S", "skills"),
                     ("n", "new"),
                     ("w", "worktree"),
                     ("K", "kill"),
