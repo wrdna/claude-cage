@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
@@ -266,7 +267,7 @@ pub fn role_color(role: &str) -> Color {
 /// Returns exit code.
 pub fn handle_task_cmd(args: &[String]) -> i32 {
     if args.is_empty() {
-        eprintln!("Usage: claude-cage task <init|add|status|output|append|nudge|clear|list>");
+        eprintln!("Usage: claude-cage task <init|add|status|output|append|nudge|clear|list|get|wait|spawn>");
         return 1;
     }
 
@@ -279,6 +280,9 @@ pub fn handle_task_cmd(args: &[String]) -> i32 {
         "nudge" => cmd_nudge(&args[1..]),
         "clear" => cmd_clear(),
         "list" => cmd_list(),
+        "get" => cmd_get(&args[1..]),
+        "wait" => cmd_wait(&args[1..]),
+        "spawn" => cmd_spawn(&args[1..]),
         other => {
             eprintln!("Unknown task subcommand: {}", other);
             1
@@ -446,6 +450,178 @@ fn cmd_list() -> i32 {
     if let Ok(json) = serde_json::to_string_pretty(&tasks) {
         println!("{}", json);
     }
+    0
+}
+
+/// claude-cage task get <id> — print one task as JSON
+fn cmd_get(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("Usage: claude-cage task get <id>");
+        return 1;
+    }
+    let id = &args[0];
+    let tasks = load_tasks();
+    match find_task(&tasks, id) {
+        Some(t) => {
+            if let Ok(json) = serde_json::to_string_pretty(t) {
+                println!("{}", json);
+            }
+            0
+        }
+        None => {
+            eprintln!("Task '{}' not found", id);
+            1
+        }
+    }
+}
+
+/// claude-cage task wait <id> [--timeout SECONDS] [--poll-ms MS]
+/// Block until the task's status becomes Completed (exit 0) or Failed (exit 1).
+/// Exit 124 on timeout (Unix convention). Exit 2 if the task never appears
+/// before the timeout expires.
+fn cmd_wait(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("Usage: claude-cage task wait <id> [--timeout SECONDS] [--poll-ms MS]");
+        return 1;
+    }
+    let id = &args[0];
+    let timeout: Option<u64> = parse_flag(args, "--timeout").and_then(|s| s.parse().ok());
+    let poll_ms: u64 = parse_flag(args, "--poll-ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+
+    let start = Instant::now();
+    let mut ever_seen = false;
+    loop {
+        let tasks = load_tasks();
+        if let Some(t) = find_task(&tasks, id) {
+            ever_seen = true;
+            match t.status {
+                TaskStatus::Completed => return 0,
+                TaskStatus::Failed => return 1,
+                _ => {}
+            }
+        }
+        if let Some(t_secs) = timeout {
+            if start.elapsed() > Duration::from_secs(t_secs) {
+                if !ever_seen {
+                    eprintln!("Timeout: task '{}' never appeared", id);
+                    return 2;
+                }
+                eprintln!("Timeout waiting for task '{}'", id);
+                return 124;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(poll_ms));
+    }
+}
+
+/// claude-cage task spawn <id> --command <cmd> [--name <name>] [--role <role>] [--parent <parent-id>]
+/// Atomically: spawn a new tmux window running <cmd>, capture its pane id,
+/// register a task with that pane linked. Prints `<id>\t<pane-id>` on success.
+/// Requires a running tmux server.
+fn cmd_spawn(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!(
+            "Usage: claude-cage task spawn <id> --command <cmd> [--name <name>] [--role <role>] [--parent <parent-id>]"
+        );
+        return 1;
+    }
+    let id = &args[0];
+
+    let cmd = match parse_flag(args, "--command") {
+        Some(c) => c,
+        None => {
+            eprintln!("--command is required");
+            return 1;
+        }
+    };
+    let name = parse_flag(args, "--name").unwrap_or_else(|| id.clone());
+    let role = parse_flag(args, "--role").unwrap_or_else(|| "implement".to_string());
+    let parent = parse_flag(args, "--parent");
+
+    // Reject id collision before spawning a pane (avoid orphaning the pane).
+    {
+        let tasks = load_tasks();
+        if find_task(&tasks, id).is_some() {
+            eprintln!("Task id '{}' already exists", id);
+            return 1;
+        }
+        if let Some(ref p) = parent {
+            if find_task(&tasks, p).is_none() {
+                eprintln!("Parent task '{}' not found", p);
+                return 1;
+            }
+        }
+    }
+
+    // tmux new-window -d (don't switch), -P (print info), -F '#{pane_id}', -n <name>
+    let output = Command::new("tmux")
+        .args(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-n",
+            &name,
+            "--",
+            "bash",
+            "-lc",
+            &cmd,
+        ])
+        .output();
+
+    let pane_id = match output {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        Ok(out) => {
+            eprintln!(
+                "tmux new-window failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("Failed to spawn tmux: {}", e);
+            return 1;
+        }
+    };
+
+    if pane_id.is_empty() {
+        eprintln!("tmux did not return a pane id");
+        return 1;
+    }
+
+    let mut tasks = load_tasks();
+    let task = Task {
+        id: id.clone(),
+        name: name.clone(),
+        status: TaskStatus::InProgress,
+        role,
+        pane_id: Some(pane_id.clone()),
+        subtasks: Vec::new(),
+        output: String::new(),
+        created_at: now_unix(),
+    };
+
+    if let Some(p) = parent {
+        if !add_subtask(&mut tasks, &p, task) {
+            // Parent went away between our check and now — leave the pane
+            // alive so the user can recover it manually, but report failure.
+            eprintln!(
+                "Parent task '{}' disappeared mid-spawn (pane {} is alive)",
+                p, pane_id
+            );
+            return 1;
+        }
+    } else {
+        tasks.push(task);
+    }
+    save_tasks(&tasks);
+
+    println!("{}\t{}", id, pane_id);
     0
 }
 

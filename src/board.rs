@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
@@ -250,7 +250,7 @@ pub fn task_name_for(task_id: &str) -> Option<String> {
 /// Handle `claude-cage board <subcommand> [args...]`
 pub fn handle_board_cmd(args: &[String]) -> i32 {
     if args.is_empty() {
-        eprintln!("Usage: claude-cage board <post|read|pin|reply|clear|list>");
+        eprintln!("Usage: claude-cage board <post|read|pin|reply|clear|list|watch>");
         return 1;
     }
 
@@ -261,6 +261,7 @@ pub fn handle_board_cmd(args: &[String]) -> i32 {
         "reply" => cmd_reply(&args[1..]),
         "clear" => cmd_clear(),
         "list" => cmd_list(&args[1..]),
+        "watch" => cmd_watch(&args[1..]),
         other => {
             eprintln!("Unknown board subcommand: {}", other);
             1
@@ -443,6 +444,108 @@ fn cmd_list(args: &[String]) -> i32 {
         }
     }
     0
+}
+
+/// claude-cage board watch [--tag <tag>] [--from <task-id>] [--to <task-id>]
+///                          [--since-id <entry-id>] [--last <n>] [--poll-ms <ms>] [--json]
+/// Tail-follow new entries appended to the board. Starts at "now" by default;
+/// --last N backfills the last N entries first; --since-id resumes after a
+/// specific entry. Filters: --tag, --from (poster), --to (directed-to).
+/// Output: one line per matching entry (same shape as `read`), flushed.
+/// Use --json for one JSON object per line (machine-readable).
+fn cmd_watch(args: &[String]) -> i32 {
+    let tag_filter = parse_flag(args, "--tag").and_then(|s| EntryTag::from_str(&s));
+    let from_filter = parse_flag(args, "--from");
+    let to_filter = parse_flag(args, "--to");
+    let since_id = parse_flag(args, "--since-id");
+    let last_n: Option<usize> = parse_flag(args, "--last").and_then(|s| s.parse().ok());
+    let poll_ms: u64 = parse_flag(args, "--poll-ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    let json_mode = args.iter().any(|a| a == "--json");
+
+    let matches = |e: &BoardEntry| -> bool {
+        if let Some(t) = &tag_filter {
+            if &e.tag != t {
+                return false;
+            }
+        }
+        if let Some(f) = &from_filter {
+            if &e.task_id != f {
+                return false;
+            }
+        }
+        if let Some(to) = &to_filter {
+            if e.directed_to.as_deref() != Some(to.as_str()) {
+                return false;
+            }
+        }
+        true
+    };
+
+    let emit = |entry: &BoardEntry| {
+        let stdout = std::io::stdout();
+        let mut h = stdout.lock();
+        if json_mode {
+            if let Ok(json) = serde_json::to_string(entry) {
+                let _ = writeln!(h, "{}", json);
+            }
+        } else {
+            let _ = writeln!(
+                h,
+                "[{}] {} [{}] {}: {}{}",
+                relative_time(entry.timestamp),
+                entry.tag.symbol(),
+                entry.tag.label(),
+                if entry.task_id.is_empty() {
+                    "user"
+                } else {
+                    &entry.task_id
+                },
+                entry.content,
+                if entry.pinned { " (pinned)" } else { "" },
+            );
+        }
+        let _ = h.flush();
+    };
+
+    // Establish starting point. Priority: --since-id > --last > "now."
+    let entries = load_entries();
+    let mut last_count = if let Some(sid) = &since_id {
+        match entries.iter().position(|e| &e.id == sid) {
+            Some(i) => i + 1, // start AFTER since-id
+            None => entries.len(), // not found → start from now
+        }
+    } else if let Some(n) = last_n {
+        let start = entries.len().saturating_sub(n);
+        // Backfill: emit the last N matching entries before entering loop.
+        for entry in &entries[start..] {
+            if matches(entry) {
+                emit(entry);
+            }
+        }
+        entries.len()
+    } else {
+        entries.len()
+    };
+
+    loop {
+        let entries = load_entries();
+        if entries.len() > last_count {
+            for entry in &entries[last_count..] {
+                if matches(entry) {
+                    emit(entry);
+                }
+            }
+            last_count = entries.len();
+        } else if entries.len() < last_count {
+            // Board was cleared / truncated. Reset to current end so we don't
+            // re-emit forever; flag this on stderr for the watcher to see.
+            eprintln!("[watch] board shrank ({} → {}); resyncing", last_count, entries.len());
+            last_count = entries.len();
+        }
+        std::thread::sleep(Duration::from_millis(poll_ms));
+    }
 }
 
 /// Parse a --flag value from args.

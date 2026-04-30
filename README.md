@@ -182,6 +182,21 @@ claude-cage task nudge <id>
 # List all tasks as JSON
 claude-cage task list
 
+# Get a single task as JSON (exit 1 if not found)
+claude-cage task get <id>
+
+# Block until a task completes; exit 0 if completed, 1 if failed,
+# 2 if the task never appeared before --timeout, 124 if existed-but-timed-out.
+# --poll-ms defaults to 200ms; --timeout defaults to forever.
+claude-cage task wait <id> [--timeout <seconds>] [--poll-ms <ms>]
+
+# Atomically: spawn a tmux window running <cmd>, capture the pane id,
+# register a task linked to that pane. Prints "<id>\t<pane-id>" on success.
+# Requires a running tmux server. Rejects id collisions and missing parents
+# before spawning the pane (no orphans).
+claude-cage task spawn <id> --command <cmd> [--name <name>]
+                            [--role <role>] [--parent <parent-id>]
+
 # Clear all tasks
 claude-cage task clear
 ```
@@ -222,6 +237,14 @@ claude-cage board pin <entry-id>
 
 # List all entries (or --json for machine-readable)
 claude-cage board list [--json]
+
+# Tail-follow new entries as they're posted (one line per match, flushed).
+# Default starts at "now"; --last <n> backfills the last n; --since-id <eid>
+# resumes after a specific entry. Filters: --tag, --from (poster task),
+# --to (directed-to task). --json emits one JSON object per line.
+claude-cage board watch [--tag <tag>] [--from <task-id>] [--to <task-id>]
+                        [--since-id <entry-id>] [--last <n>]
+                        [--poll-ms <ms>] [--json]
 
 # Clear the board
 claude-cage board clear
